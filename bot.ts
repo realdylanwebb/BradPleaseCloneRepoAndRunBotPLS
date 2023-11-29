@@ -10,6 +10,7 @@ import {
 import * as ytdl from "ytdl-core";
 import config from "./config";
 import * as youtubeSearch from "youtube-search";
+import { OpusEncoder } from "@discordjs/opus";
 
 var ytOptions: youtubeSearch.YouTubeSearchOptions = {
   maxResults: 1,
@@ -130,7 +131,11 @@ client.on("messageCreate", async (message: Message) => {
   }
 });
 
-async function playSong(message: Message) {
+async function playSong(
+  message: Message,
+  retries: number = 3,
+  startTime: number = 0
+) {
   const guildId = message.guild?.id || "";
   const songs = queue.get(guildId);
 
@@ -141,8 +146,6 @@ async function playSong(message: Message) {
 
   const song = songs[0];
   const songInfo = await ytdl.getInfo(song.url);
-
-  // Join the same voice channel as the user who requested the song
   const voiceChannel = message.member?.voice.channel as VoiceChannel;
 
   if (!voiceChannel) {
@@ -157,34 +160,63 @@ async function playSong(message: Message) {
   });
 
   try {
-    // Make sure the connection is ready before playing audio
     await entersState(connection, VoiceConnectionStatus.Ready, 30e3);
 
     const stream = ytdl.downloadFromInfo(songInfo, {
       filter: "audioonly",
       quality: "highestaudio",
     });
-    const audioResource = createAudioResource(stream);
+
+    // @ts-expect-error
+    const audioResource = createAudioResource(stream, { start: startTime });
     audioPlayer.play(audioResource);
     connection.subscribe(audioPlayer);
 
     audioPlayer.once(AudioPlayerStatus.Idle, () => {
-      // Remove the finished song from the queue and play the next song
       queue.get(guildId)?.shift();
       playSong(message);
     });
 
-    audioPlayer.once("error", (error) => {
+    audioPlayer.once("error", async (error) => {
       console.error(`Error in audio player: ${error.message}`);
-      message.channel.send("Error playing the song, skipping to the next one!");
-      queue.get(guildId)?.shift();
-      playSong(message);
+      console.error(error);
+      message.channel.send(
+        "Error playing the song, attempting to reconnect and continue..."
+      );
+
+      if (retries > 0) {
+        const currentTime = audioResource.playbackDuration;
+        audioPlayer.stop(true);
+
+        // Wait for a short period before retrying
+        setTimeout(() => {
+          playSong(message, retries - 1, currentTime);
+        }, 1000);
+      } else {
+        message.channel.send(
+          "Failed to reconnect after multiple retries, skipping to the next song."
+        );
+        queue.get(guildId)?.shift();
+        playSong(message);
+      }
     });
 
     message.channel.send(`Now playing: ${song.title}`);
   } catch (error) {
     console.error(`Error creating voice connection: ${error.message}`);
     message.channel.send("Error joining the voice channel!");
+
+    if (retries > 0) {
+      console.error(`Retrying to play the song (${retries} retries left)`);
+      setTimeout(() => playSong(message, retries - 1, startTime), 1000);
+    } else {
+      console.error(`Failed to play the song after ${retries} retries`);
+      message.channel.send(
+        "Failed to play the song after multiple retries, skipping to the next one!"
+      );
+      queue.get(guildId)?.shift();
+      playSong(message);
+    }
   }
 }
 
